@@ -11,4 +11,5 @@ rag = RAGSystem(file_path="a_short_guide_to_eu.pdf",
 
 
 result = rag.ask("What is the EU doing to improve things where I live?")
-    
+
+result2 = rag.ask("What is the EU doing?")
