@@ -14,7 +14,7 @@ from langchain_core.retrievers import BaseRetriever
 import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 load_dotenv()
 logging.basicConfig(
@@ -74,7 +74,7 @@ class RAGSystem(BaseModel):
     """
     file_path: str | Path
     prompt_template: str
-    db_name: str = "chroma_db"  # Default value
+    db_name: str = None
     chunk_size: int = Field(default=1000, ge=100, le=10000)  # With constraints
     chunk_overlap: int = Field(default=100, ge=0)
     model_embedding: str = "gemini-embedding-001"
@@ -91,6 +91,18 @@ class RAGSystem(BaseModel):
     _cached_prompt_template: Optional[ChatPromptTemplate] = PrivateAttr(default=None)
     _cached_llm: Optional[ChatGoogleGenerativeAI] = PrivateAttr(default=None)
     _cached_chain: Optional[Runnable] = PrivateAttr(default=None)
+
+    @model_validator(mode='after')
+    def _set_db_name_from_file_path(self):
+        """Automatically set db_name from file_path if not provided."""
+        if self.db_name is None:
+            # Convert file_path to Path object if it's a string
+            file_path_obj = Path(self.file_path)
+            # Get the filename without extension
+            filename_without_ext = file_path_obj.stem
+            # Append "_db" to create the database name
+            self.db_name = f"{filename_without_ext}_db"
+        return self
 
     def _load_data(self) -> list[Document]:
         """
@@ -123,6 +135,7 @@ class RAGSystem(BaseModel):
             
             logger.info(f"Loading PDF file from {self.file_path}")
             loader = PyPDFLoader(self.file_path)
+            #self.db_name = self.file_path.stem + "_chroma_db"
             data = loader.load()
             self._cached_documents = data
             return data
