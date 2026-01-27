@@ -1,4 +1,4 @@
-# RAG EU Documentation Assistant
+# RAG Documentation Assistant
 
 A Retrieval-Augmented Generation (RAG) system for querying PDF documents using Google's Gemini AI models. This project implements a complete RAG pipeline that enables intelligent question-answering over any PDF document.
 
