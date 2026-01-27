@@ -14,7 +14,7 @@ from langchain_core.retrievers import BaseRetriever
 import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 load_dotenv()
 logging.basicConfig(
@@ -74,7 +74,7 @@ class RAGSystem(BaseModel):
     """
     file_path: str | Path
     prompt_template: str
-    db_name: str = "chroma_db"  # Default value
+    db_name: str = None
     chunk_size: int = Field(default=1000, ge=100, le=10000)  # With constraints
     chunk_overlap: int = Field(default=100, ge=0)
     model_embedding: str = "gemini-embedding-001"
@@ -82,6 +82,27 @@ class RAGSystem(BaseModel):
     search_type: str = "similarity"
     search_kwargs: Dict[str, Any] = Field(default_factory=lambda: {"k": 3})
     temperature: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    _cached_documents: Optional[List[Document]] = PrivateAttr(default=None)
+    _cached_chunks: Optional[List[Document]] = PrivateAttr(default=None)
+    _cached_embeddings: Optional[GoogleGenerativeAIEmbeddings] = PrivateAttr(default=None)
+    _cached_vectorstore: Optional[Chroma] = PrivateAttr(default=None)
+    _cached_retriever: Optional[BaseRetriever] = PrivateAttr(default=None)
+    _cached_prompt_template: Optional[ChatPromptTemplate] = PrivateAttr(default=None)
+    _cached_llm: Optional[ChatGoogleGenerativeAI] = PrivateAttr(default=None)
+    _cached_chain: Optional[Runnable] = PrivateAttr(default=None)
+
+    @model_validator(mode='after')
+    def _set_db_name_from_file_path(self):
+        """Automatically set db_name from file_path if not provided."""
+        if self.db_name is None:
+            # Convert file_path to Path object if it's a string
+            file_path_obj = Path(self.file_path)
+            # Get the filename without extension
+            filename_without_ext = file_path_obj.stem
+            # Append "_db" to create the database name
+            self.db_name = f"{filename_without_ext}_db"
+        return self
 
     def _load_data(self) -> list[Document]:
         """
@@ -105,13 +126,18 @@ class RAGSystem(BaseModel):
             Returns None if an error occurs during loading. Consider raising
             exceptions instead for better error handling.
         """
+        if self._cached_documents is not None:
+            return self._cached_documents
+
         try:
             if not os.path.exists(self.file_path):
                 raise FileNotFoundError(f"File not found: {self.file_path}")
             
             logger.info(f"Loading PDF file from {self.file_path}")
             loader = PyPDFLoader(self.file_path)
+            #self.db_name = self.file_path.stem + "_chroma_db"
             data = loader.load()
+            self._cached_documents = data
             return data
         except Exception as e:
             logger.error(f"Error loading data: {e}")
@@ -142,10 +168,17 @@ class RAGSystem(BaseModel):
             Returns None if an error occurs. The chunk size and overlap are
             controlled by self.chunk_size and self.chunk_overlap attributes.
         """
+        if self._cached_chunks is not None:
+            return self._cached_chunks
+
         try:
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
-            chunks = text_splitter.split_documents(self._load_data())
+            documents = self._load_data()
+            if documents is None:
+                return None
+            chunks = text_splitter.split_documents(documents)
             logger.info(f"Splitted data into chunks")
+            self._cached_chunks = chunks
             return chunks
         except Exception as e:
             logger.error(f"Error splitting data: {e}")
@@ -174,9 +207,14 @@ class RAGSystem(BaseModel):
             Returns None if an error occurs. The model name is specified by
             self.model_embedding attribute (default: "gemini-embedding-001").
         """
+
+        if self._cached_embeddings is not None:
+            return self._cached_embeddings
+
         try:
             client = genai.Client()
             embeddings = GoogleGenerativeAIEmbeddings(model=self.model_embedding)
+            self._cached_embeddings = embeddings
             return embeddings
         except Exception as e:
             logger.error(f"Error embedding data: {e}")
@@ -207,6 +245,10 @@ class RAGSystem(BaseModel):
             Returns None if an error occurs. The database persists automatically
             to the directory specified by self.db_name.
         """
+
+        if self._cached_vectorstore is not None:
+            return self._cached_vectorstore
+
         try:
             if os.path.exists(self.db_name):
                 vectorstore = Chroma(
@@ -215,8 +257,12 @@ class RAGSystem(BaseModel):
                 )
                 logger.info(f"Loaded existing Chroma database from {self.db_name}")
             else:
+                chunks = self._split_data()
+                if chunks is None:
+                    return None
+
                 vectorstore = Chroma.from_documents(
-                documents=self._split_data(), 
+                documents=chunks, 
                 embedding=self._embed_data_google(),
                 persist_directory=self.db_name)
                 logger.info(f"Created new Chroma database in {self.db_name}")
@@ -224,7 +270,6 @@ class RAGSystem(BaseModel):
         except Exception as e:
             logger.error(f"Error storing data: {e}")
             return None
-        
     
     def _retriever(self) -> BaseRetriever:
         """
@@ -246,12 +291,20 @@ class RAGSystem(BaseModel):
             - self.search_type: Type of search ("similarity", "mmr", etc.)
             - self.search_kwargs: Additional parameters (e.g., {"k": 3} for top-3 results)
         """
+
+        if self._cached_retriever is not None:
+            return self._cached_retriever
+
         try:
-            retriever = self._store_data().as_retriever(
+            vectorstore = self._store_data()
+            if vectorstore is None:
+                return None
+            retriever = vectorstore.as_retriever(
                 search_type=self.search_type,
                 search_kwargs=self.search_kwargs
             )
             logger.info(f"Retrieved data from Chroma")
+            self._cached_retriever = retriever
             return retriever
         except Exception as e:
             logger.error(f"Error retrieving data: {e}")
@@ -273,7 +326,11 @@ class RAGSystem(BaseModel):
         Raises:
             ValueError: If the template string is invalid or missing required placeholders.
         """
+        if self._cached_prompt_template is not None:
+            return self._cached_prompt_template
+
         prompt_template = ChatPromptTemplate.from_template(self.prompt_template)
+        self._cached_prompt_template = prompt_template
         return prompt_template
     
     def _llm_google(self) -> ChatGoogleGenerativeAI:
@@ -300,8 +357,12 @@ class RAGSystem(BaseModel):
             Returns None if an error occurs. The model name and temperature are
             controlled by self.model_llm and self.temperature attributes.
         """
+        if self._cached_llm is not None:
+            return self._cached_llm
+
         try:
             llm = ChatGoogleGenerativeAI(model=self.model_llm, temperature=self.temperature)
+            self._cached_llm = llm
             return llm
         except Exception as e:
             logger.error(f"Error LLM: {e}")
@@ -363,15 +424,24 @@ class RAGSystem(BaseModel):
             - LLM: Generates the answer
             - Output parser: Converts to string
         """
+        if self._cached_chain is not None:
+            return self._cached_chain
+
         try:
+            retriever = self._retriever()
+            prompt_template = self._prompt_template()
+            llm = self._llm_google()
+            if retriever is None or prompt_template is None or llm is None:
+                return None
             chain = (
-            {"context": RunnableLambda(lambda x: x["question"]) | self._retriever() | self.format_docs
+            {"context": RunnableLambda(lambda x: x["question"]) | retriever | self.format_docs
             , "question": RunnablePassthrough()} 
-            | self._prompt_template() 
-            | self._llm_google() 
+            | prompt_template 
+            | llm 
             | StrOutputParser()
             )
             logger.info(f"Chain created")
+            self._cached_chain = chain
             return chain
         except Exception as e:
             logger.error(f"Error chain: {e}")
@@ -405,7 +475,10 @@ class RAGSystem(BaseModel):
             debugging and monitoring purposes.
         """
         try:
-            result = self._chain().invoke({"question": question})
+            chain = self._chain()
+            if chain is None:
+                return None
+            result = chain.invoke({"question": question})
             logger.info("-" * 50)
             logger.info(f"Question: {question}")
             logger.info(f"Answer: {result}")
